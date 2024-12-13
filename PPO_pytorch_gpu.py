@@ -6,6 +6,7 @@ from collections import deque
 import random
 import os
 import time
+from torch.utils.tensorboard import SummaryWriter
 
 # Hyperparameters
 GAMMA = 0.99  # Discount factor
@@ -17,38 +18,58 @@ ENTROPY_COEF = 0.01  # Entropy regularization coefficient
 BATCH_SIZE = 64
 EPOCHS = 10
 REPLAY_SIZE = 2000
-WIDTH = 96
-HEIGHT = 88
+WIDTH = 84
+HEIGHT = 84
+
+# Optimized hyperparameters
+WIDTH = 84  # Reduced from 160
+HEIGHT = 84  # Reduced from 160
 
 class ActorCriticNetwork(nn.Module):
     def __init__(self, state_h, state_w, action_dim):
         super().__init__()
-        # Convolutional layers
+        # Improved CNN architecture
         self.conv_layers = nn.Sequential(
-            nn.Conv2d(1, 32, kernel_size=5, stride=1, padding=2),
+            nn.Conv2d(1, 32, kernel_size=3, stride=2, padding=1),  # Reduced kernel size, increased stride
             nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2, padding=1),
-            nn.Conv2d(32, 64, kernel_size=5, stride=1, padding=2),
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
             nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2, padding=1)
+            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(64, 32, kernel_size=3, stride=1, padding=1),
+            nn.ReLU()
         )
+        
+        # Add batch normalization
+        self.batch_norm = nn.BatchNorm2d(32)
         
         # Calculate flattened size
         self._to_linear = self._get_conv_output_size((1, state_h, state_w))
         
-        # Shared layers
+        # Improved shared layers
         self.shared_fc = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(self._to_linear, 256),
+            nn.Linear(self._to_linear, 512),  # Increased units
+            nn.ReLU(),
+            nn.LayerNorm(512),
+            nn.Linear(512, 256),
             nn.ReLU(),
             nn.LayerNorm(256)
         )
         
-        # Actor head
-        self.actor_head = nn.Linear(256, action_dim)
+        # Actor head with smaller final layer
+        self.actor_head = nn.Sequential(
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, action_dim)
+        )
         
-        # Critic head
-        self.critic_head = nn.Linear(256, 1)
+        # Critic head with smaller final layer
+        self.critic_head = nn.Sequential(
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, 1)
+        )
 
     def _get_conv_output_size(self, shape):
         with torch.no_grad():
@@ -58,6 +79,7 @@ class ActorCriticNetwork(nn.Module):
 
     def forward(self, x, mode='both'):
         x = self.conv_layers(x)
+        x = self.batch_norm(x)
         x = self.shared_fc(x)
         
         if mode == 'actor':
@@ -101,6 +123,8 @@ class PPO:
         self.critic_scheduler = optim.lr_scheduler.ExponentialLR(
             self.critic_optimizer, gamma=0.9
         )
+        self.writer = SummaryWriter('./runs')
+        self.global_step = 0  # 新增這一行
 
          # Use full file path and ensure directory exists
         self.log_file_path = log_file
@@ -150,18 +174,25 @@ class PPO:
 
     def train(self):
         if len(self.replay_buffer) < BATCH_SIZE:
-            return
+                return
 
         # Sample from replay buffer
         minibatch = random.sample(self.replay_buffer, BATCH_SIZE)
-        states, actions, rewards, next_states, dones, old_log_probs = zip(*minibatch)
+        
+        # Convert lists to numpy arrays first
+        states = np.array([item[0] for item in minibatch])
+        actions = np.array([item[1] for item in minibatch])
+        rewards = np.array([item[2] for item in minibatch])
+        next_states = np.array([item[3] for item in minibatch])
+        dones = np.array([item[4] for item in minibatch])
+        old_log_probs = np.array([item[5] for item in minibatch])
 
-        # Convert to tensors and ensure correct shape
+        # Reshape states and next_states to have correct dimensions [batch_size, channels, height, width]
         states = torch.FloatTensor(states).to(self.device)
-        states = states.unsqueeze(1)  # Add channel dimension: [batch_size, 1, height, width]
+        states = states.view(BATCH_SIZE, 1, HEIGHT, WIDTH)  # Changed from unsqueeze
         
         next_states = torch.FloatTensor(next_states).to(self.device)
-        next_states = next_states.unsqueeze(1)  # Add channel dimension
+        next_states = next_states.view(BATCH_SIZE, 1, HEIGHT, WIDTH)  # Changed from unsqueeze
         
         actions = torch.LongTensor(actions).to(self.device)
         rewards = torch.FloatTensor(rewards).to(self.device)
@@ -207,6 +238,22 @@ class PPO:
             actor_loss = policy_loss - ENTROPY_COEF * entropy
             total_loss = actor_loss + 0.5 * critic_loss
 
+            # TensorBoard Logging
+            self.writer.add_scalar('Loss/Actor', actor_loss.item(), self.global_step)
+            self.writer.add_scalar('Loss/Critic', critic_loss.item(), self.global_step)
+            self.writer.add_scalar('Loss/Total', total_loss.item(), self.global_step)
+            self.writer.add_scalar('Entropy', entropy.item(), self.global_step)
+
+            # Log weights and gradients
+            for name, param in self.actor.named_parameters():
+                self.writer.add_histogram(f'Actor/weights/{name}', param, self.global_step)
+                if param.grad is not None:
+                    self.writer.add_histogram(f'Actor/gradients/{name}', param.grad, self.global_step)
+            
+            for name, param in self.critic.named_parameters():
+                self.writer.add_histogram(f'Critic/weights/{name}', param, self.global_step)
+                if param.grad is not None:
+                    self.writer.add_histogram(f'Critic/gradients/{name}', param.grad, self.global_step)
 
             # Backpropagation
             self.actor_optimizer.zero_grad()
@@ -224,6 +271,10 @@ class PPO:
             self.log_file.write(f"Epoch {epoch}: Actor Loss={actor_loss.item()}, "
                                 f"Critic Loss={critic_loss.item()}, "
                                 f"Total Loss={total_loss.item()}\n")
+            self.log_file.flush()  # Ensure immediate writing
+
+            # Increment global step
+            self.global_step += 1
 
         # Step learning rate schedulers
         self.actor_scheduler.step()
@@ -247,17 +298,16 @@ class PPO:
         return action, log_prob
 
     def store_data(self, state, action, reward, next_state, done, log_prob):
-        """
-        Store experience in replay buffer
+        # Ensure state and next_state are 2D arrays
+        if isinstance(state, torch.Tensor):
+            state = state.squeeze().cpu().numpy()
+        if isinstance(next_state, torch.Tensor):
+            next_state = next_state.squeeze().cpu().numpy()
+            
+        # Ensure correct shape
+        state = np.array(state).reshape(HEIGHT, WIDTH)
+        next_state = np.array(next_state).reshape(HEIGHT, WIDTH)
         
-        Args:
-            state: Current state
-            action: Chosen action
-            reward: Received reward
-            next_state: Next state
-            done: Whether it's a terminal state
-            log_prob: Log probability of the action
-        """
         self.replay_buffer.append((state, action, reward, next_state, done, log_prob))
 
     def save_model(self):
